@@ -1,0 +1,32 @@
+# Build output
+build/
+out/
+bin/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Gradle
+.gradle/
+
+# Market data - multi-GB, never commit
+data/*.itch
+data/*.gz
+data/*.bin
+!data/README.md
+
+# Benchmark output
+*.hgrm
+results/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
