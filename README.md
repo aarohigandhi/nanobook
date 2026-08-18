@@ -16,14 +16,15 @@ data, with the performance claims measured instead of asserted.
 | Phase | | |
 |---|---|---|
 | 1 | ITCH 5.0 feed handler | **done** |
-| 2 | Reference order book | in progress |
-| 3 | Array-backed order book | — |
-| 4 | Matching engine | — |
-| 5 | Differential fuzzer | — |
+| 2 | Reference order book | **done** |
+| 3 | Array-backed order book | **done** |
+| 4 | Matching engine | **done** |
+| 5 | Differential fuzzer | in progress |
 | 6 | Benchmarks | — |
 
-Results tables below are filled in as phases land. Nothing is quoted before it
-is measured.
+63 tests, including a randomized differential check that the two order book
+implementations cannot be told apart. Results tables below are filled in as
+phases land — nothing is quoted before it is measured.
 
 ## Running it
 
@@ -37,6 +38,12 @@ Then fetch a session file (see [data/README.md](data/README.md)) and replay it:
 
 ```bash
 ./gradlew replay --args="data/01302020.NASDAQ_ITCH50"
+```
+
+To reconstruct one symbol's book across the whole session:
+
+```bash
+./gradlew replay --args="data/01302020.NASDAQ_ITCH50 --book AAPL"
 ```
 
 ## What is here
@@ -101,6 +108,45 @@ Hashing is a Fibonacci mix rather than raw masking, because ITCH order
 references are sequential and sequential keys with a weak mixer collapse into
 one enormous probe run.
 
+### Phases 2 and 3 — two order books
+
+`NaiveOrderBook` is a `TreeMap` of price to a `LinkedList` of orders per side,
+with an `Order` object each and a `HashMap` for reference lookup. It is slow on
+purpose. It exists to be read and believed.
+
+`ArrayOrderBook` produces identical output with no objects at all. An order is
+an index into parallel primitive arrays, drawn from a free list threaded through
+`orderNext`. Price levels are indexed directly by tick offset from a base price
+— one array load instead of a red-black descent with a cache miss per node. The
+touch is cached and repaired incrementally: an add can only improve it, and a
+removal only triggers a scan when it empties the touch level.
+
+Prices far from the touch are legal and do occur, so the window regrows outward
+and copies its levels rather than rejecting them. Order prices are stored rather
+than tick indices precisely so that regrowing does not require touching every
+live order.
+
+Keeping both is not redundancy. The slow one is the oracle the fast one is
+tested against, and a reference implementation you can read is worth more than
+the throughput it costs.
+
+### Phase 4 — matching engine
+
+Price-time priority, with limit, market, IOC and FOK orders. Fills print at the
+**maker's** resting price: the taker crossed the spread, so price improvement is
+theirs. A fill-or-kill is decided before anything is touched, so a rejected one
+leaves no partial fills to unwind.
+
+A replacement is a genuinely new order — it joins the back of the queue and
+crosses if it is marketable. It does not inherit the original's position. That
+is why a trader reducing size cancels down instead of replacing, and it is the
+rule this kind of engine most often gets wrong.
+
+The engine is deterministic by construction: nothing reads a clock, hashes an
+identity, or iterates a container with unspecified order. Same input, byte-
+identical execution report stream, every run. Phase 5 depends entirely on that
+holding, so there is a test that asserts it directly.
+
 ## Testing
 
 ```bash
@@ -113,8 +159,14 @@ still parses cleanly and produces plausible-looking prices and share counts. It
 would silently poison every downstream result, and only a round-trip test
 catches it.
 
-The hash map is checked against `java.util.HashMap` under randomized churn —
-the same differential technique Phase 5 applies to the book itself.
+The two order books are driven through identical randomized message streams and
+compared after every single message — best prices, sizes, depth and order count.
+The naive book is the oracle; any disagreement is a bug in the fast one. The
+hash map gets the same treatment against `java.util.HashMap`.
+
+The engine has an invariant test that asserts the book never rests crossed: any
+bid at or above the best ask should have matched instead of resting, and a
+cached touch that is repaired incorrectly shows up there first.
 
 ## Benchmarks
 
