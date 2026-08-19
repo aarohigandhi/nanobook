@@ -9,10 +9,10 @@ bin/
 # Gradle
 .gradle/
 
-# Market data - multi-GB, never commit
-data/*.itch
-data/*.gz
-data/*.bin
+# Market data - multi-GB, never commit.
+# Ignore everything in data/ by extension-agnostic rule: real ITCH files are
+# named like 12302019.NASDAQ_ITCH50, with no extension to match on.
+data/*
 !data/README.md
 
 # Benchmark output - numbers live in README.md and DESIGN.md, raw files go stale
