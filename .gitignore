@@ -15,8 +15,9 @@ data/*.gz
 data/*.bin
 !data/README.md
 
-# Benchmark output
+# Benchmark output - numbers live in README.md and DESIGN.md, raw files go stale
 *.hgrm
+jmh-result.*
 results/
 
 # IDE

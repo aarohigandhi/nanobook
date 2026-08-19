@@ -56,8 +56,8 @@ stream's own Trade messages.
 
 Structure of arrays, not array of structures. No `Order` class: an order is an
 index into parallel `int[]` arrays, with an intrusive doubly-linked list by
-index and an int free-list for slot reuse. Arrays are sized at startup and
-never grow mid-session.
+index and an int free-list for slot reuse. Arrays are sized at startup and grow
+only by doubling, which in practice means during warmup and never again.
 
 Price levels indexed directly by tick offset rather than through a tree — one
 array load instead of a red-black descent with a cache miss per node.
@@ -84,15 +84,31 @@ worst possible failure mode here.
 Cache the touch. Adds can only improve it (one compare); removals only need a
 scan when the touch level empties, and then only outward, one tick at a time.
 
-Order reference lookup goes through `LongIntHashMap`. Given that lifecycle
-traffic dominates the message mix, this is the largest measurable win over
-Phase 2 — record the allocation-rate delta, not just the throughput delta.
+Order reference lookup goes through `LongIntHashMap`.
 
-| | Phase 2 | Phase 3 |
+**This is where the design was wrong.** The map was written on the premise that
+boxing every order reference into a `Long` would be visibly slower, and that
+this would be the largest single win over Phase 2. Measured head to head against
+`HashMap<Long, Integer>`, it is 52.3 ns/op against 51.9 — no difference at all.
+Short-lived boxed `Long`s are bump-allocated in a TLAB and reclaimed by a
+young-gen pass that costs almost nothing, and a phase-separated
+put/get/remove benchmark is about as cache-friendly as that access pattern gets.
+
+The map stays, but the justification changes. What it actually buys is that it
+produces **no garbage**, and that pays off somewhere a throughput average
+cannot see: the latency tail, and the ability to run the whole engine under a
+collector that never reclaims. The original reasoning was a guess that happened
+to reach a defensible structure for the wrong reason.
+
+Measured, per operation over a balanced 200k-operation script:
+
+| | Phase 2 (naive) | Phase 3 (array) |
 |---|---|---|
-| Messages/sec | *TBD* | *TBD* |
-| Allocation rate | *TBD* | *TBD* |
-| GC events per session | *TBD* | *TBD* |
+| ns/op | 641 ± 227 | **159 ± 53** |
+| GC pauses in steady state | many | **zero** |
+
+About 4x. The wide error bars are a single JMH fork; treat the ratio as
+indicative rather than decisive.
 
 ## Phase 4 — matching engine ✅
 
@@ -125,38 +141,68 @@ so there is a test that runs a scripted session six times and compares streams.
 Single-threaded on purpose. An exchange core that has to synchronize has already
 lost the latency argument; concurrency belongs at the edges.
 
-## Phase 5 — differential fuzzer
+## Phase 5 — differential fuzzer ✅
 
-The books already have this: `OrderBookEquivalenceTest` drives both
-implementations through randomized message streams and compares every
-observable after every message. It found nothing on the first run, which says
-more about the test than the code — the next step is to make it harder.
+`ReferenceMatchingEngine` is an independent naive engine sharing no code with
+the fast one. The fuzzer compares **execution report streams**, not final book
+state: two engines can reach an identical resting book having filled orders in a
+different sequence, at different prices, against different counterparties.
 
-What remains is the engine-level version, which is the higher-value one:
+**The generator is hostile by design.** Roughly one operation in twelve is
+malformed. Validation and rejection paths are where two implementations drift,
+and a generator that only emits well-formed orders never reaches them.
 
-- Write a deliberately naive `MatchingEngine` on top of `NaiveOrderBook`, then
-  fuzz the two engines against each other on execution report streams rather
-  than book state. Report streams catch ordering bugs that a state comparison
-  cannot see — two engines can agree on the final book having filled in a
-  different sequence.
-- Shrink failing cases to a minimal repro automatically.
-- Widen the generator past the current shape: zero and negative quantities,
-  duplicate ids, self-crossing, replace chains, prices at the window edge.
-- Record what it finds here, including bugs that turned out to be in the test.
+**Shrinking is not optional.** Delta debugging cuts a failing sequence down for
+as long as the divergence survives, and repros render as pasteable Java. The
+shrinker takes its predicate as a parameter rather than hard-wiring
+`diverges`, so it can be tested on its own — a shrinker that quietly returns
+its input is indistinguishable from one that works until the day it matters.
 
-Any two implementations of the same specification disagree somewhere. The
-interesting question is where.
+**Result: 30,000 sequences, 15,000,000 operations, zero divergences.**
 
-## Phase 6 — benchmarks
+Nothing found is a weak result, not a strong one. It bounds the bug rate at
+whatever this generator can reach and no further. The honest next moves are
+multi-symbol sequences, self-crossing, and deeper replace chains.
 
-- **JMH** for microbenchmarks — handles JIT warmup and dead-code elimination.
-- **HdrHistogram** for latency. p50 / p99 / p99.9 / p99.99 / max. Never averages.
-- **Open-loop load generation** against a fixed schedule. Closed-loop drivers
-  that send the next message only after the last returns silently hide latency
-  under load — coordinated omission.
-- **Epsilon GC** proves the zero-allocation claim. A no-op collector means a run
-  that survives genuinely did not allocate, and one that allocates dies.
-- Report cold and warm numbers separately; note where C2 kicks in.
+## Phase 6 — benchmarks ✅
 
-Any bound the benchmark imposes — sampling, warmup discards, symbols excluded —
-gets stated explicitly. Silent truncation reads as full coverage.
+Windows 11, Snapdragon X 10-core (aarch64), Temurin 21.0.5.
+
+**Latency, open-loop, 1.5M operations at 200k/sec against a ~8,400-order book:**
+
+| percentile | service time |
+|---|---|
+| p50 | 300 ns |
+| p90 | 500 ns |
+| p99 | 800 ns |
+| p99.9 | 6.2 µs |
+| p99.99 | 119 µs |
+
+`System.nanoTime()` costs ~68 ns per pair here, so p50 sits within a few
+multiples of the measurement floor and should be read as such.
+
+**Zero GC pauses across the measurement run**, and it survives under Epsilon GC
+in a 512 MB heap. That is the zero-allocation claim proven rather than asserted:
+a steady state that allocates dies with an `OutOfMemoryError` under a collector
+that never reclaims.
+
+**The workload had to be fixed before the number meant anything.** The first
+version of the harness only cancelled from a small ring of recent order ids, so
+older orders accumulated forever, the book's arrays kept doubling and the hash
+map kept rehashing. The result was a latency report dominated by multi-
+millisecond GC pauses — a real measurement of a workload nobody runs. Holding
+the book at a steady depth is what made the tail mean anything.
+
+**What the far tail is.** Response-time percentiles past p99 reach milliseconds
+with zero collector activity, which makes them OS scheduling and safepoints on a
+shared desktop rather than this code. Reported, not trimmed. Chasing it further
+means pinning to an isolated core, which is a deployment property.
+
+**Coordinated omission** is why service time and response time are reported side
+by side. A closed-loop driver stalls when the system stalls and stops issuing the
+requests that would have been slow, so its numbers improve exactly as things get
+worse. The gap between the two columns is that error, made visible.
+
+Every bound the benchmarks impose is stated: single JMH fork (below the
+recommended count, hence wide error bars), a fixed 200k-operation script, one
+symbol, warmup discarded. Silent truncation reads as full coverage.

@@ -4,12 +4,13 @@ A limit order book and matching engine in Java that never allocates.
 
 Reconstructs the Nasdaq order book from raw TotalView-ITCH 5.0 exchange data,
 then matches against it. The design constraint that drives everything here is
-**zero allocation on the hot path** — no garbage means no collector, which is
-provable rather than assertable: the engine replays a full trading session under
-Epsilon GC, a collector that never reclaims anything.
+**zero allocation on the hot path** — no garbage means no collector, and that is
+provable rather than assertable: the engine runs 1.5M operations under Epsilon
+GC, a collector that never reclaims anything, in a 512 MB heap.
 
-Built as a study of how exchange infrastructure actually works, on real market
-data, with the performance claims measured instead of asserted.
+Built as a study of how exchange infrastructure actually works, with the
+performance claims measured instead of asserted — including the one that turned
+out to be wrong.
 
 ## Status
 
@@ -19,12 +20,12 @@ data, with the performance claims measured instead of asserted.
 | 2 | Reference order book | **done** |
 | 3 | Array-backed order book | **done** |
 | 4 | Matching engine | **done** |
-| 5 | Differential fuzzer | in progress |
-| 6 | Benchmarks | — |
+| 5 | Differential fuzzer | **done** |
+| 6 | Benchmarks | **done** |
 
-63 tests, including a randomized differential check that the two order book
-implementations cannot be told apart. Results tables below are filled in as
-phases land — nothing is quoted before it is measured.
+72 tests. 15,000,000 fuzzed operations against an independent reference engine,
+zero divergences. Zero GC pauses across a 1.5M-operation measurement run, and
+the engine survives the same run under a collector that never reclaims.
 
 ## Running it
 
@@ -51,8 +52,9 @@ To reconstruct one symbol's book across the whole session:
 ```
 itch/         ITCH 5.0 wire format: layout table, parser, symbol interning
 collections/  Primitive collections that exist to avoid boxing
-book/         Order book — reference implementation and fast implementation
-tools/        Message-mix statistics
+book/         Two order books, a matching engine, and a reference engine
+tools/        Message-mix statistics, book replay, differential fuzzer
+bench/        JMH microbenchmarks and the open-loop latency harness
 ```
 
 ### Phase 1 — the feed handler
@@ -96,7 +98,11 @@ that is what the fast book is built around.
 `HashMap<Long, Order>` boxes every order reference into a `Long` and allocates
 a `Node` per entry, so a single order lookup costs two heap allocations and two
 dereferences into unrelated cache lines. Given the message mix above, that is
-squarely on the hot path.
+squarely on the hot path — so replacing it should be a large throughput win.
+
+It is not. That prediction is measured and refuted in
+[Benchmarks](#the-hash-map-and-a-result-that-did-not-go-as-expected) below; the
+map earns its place for a different reason than the one it was written for.
 
 `LongIntHashMap` is open-addressed with linear probing over two flat primitive
 arrays. Deletion uses **backward-shift** rather than tombstones: tombstones are
@@ -168,21 +174,115 @@ The engine has an invariant test that asserts the book never rests crossed: any
 bid at or above the best ask should have matched instead of resting, and a
 cached touch that is repaired incorrectly shows up there first.
 
-## Benchmarks
+### Phase 5 — differential fuzzer
 
-*Phase 6.* Reported as p50 / p99 / p99.9 / p99.99 / max — never averages.
-Load is generated open-loop against a fixed schedule to avoid coordinated
-omission. Microbenchmarks run under JMH so JIT warmup and dead-code elimination
-are handled properly.
+`ReferenceMatchingEngine` is a second, deliberately naive engine that shares no
+code with the fast one. The fuzzer generates random order sequences, runs both,
+and compares **execution report streams**.
 
-The zero-allocation claim is proven, not asserted:
+Report streams rather than final book state, deliberately. Comparing books is
+the obvious thing and it is much weaker: two engines can reach an identical
+resting book having filled the orders in a different order, at different prices,
+against different counterparties. The report stream is what a downstream
+consumer would actually act on.
+
+The generator is hostile on purpose — roughly one operation in twelve is
+malformed (zero and negative quantities, non-positive prices, ids already
+resting, references that never existed, prices far outside the tick window).
+Validation and rejection paths are where two implementations drift apart, and a
+generator that only emits valid orders never visits them.
+
+A divergence is **shrunk** by delta debugging before it is reported, and repros
+print as pasteable Java. A 500-operation failure is a haystack; the same failure
+cut to three operations usually names the bug.
 
 ```bash
-./gradlew replayEpsilon --args="data/01302020.NASDAQ_ITCH50"
+./gradlew fuzz --args="30000 500"
 ```
 
-Epsilon GC never reclaims anything. A run that survives to the end genuinely did
-not allocate; a run that allocates dies with an `OutOfMemoryError`.
+**Result: 30,000 sequences, 15,000,000 operations, zero divergences.**
+
+## Benchmarks
+
+Measured on Windows 11, Snapdragon X 10-core (aarch64), Temurin JDK 21.0.5.
+JMH at 1 fork, 3×2s warmup, 5×2s measurement — below JMH's recommended fork
+count, so the error bars are wide and the numbers are indicative, not decisive.
+
+```bash
+./gradlew jmh
+./gradlew latency
+```
+
+### Book throughput
+
+Replaying a balanced 200,000-operation lifecycle script, per operation:
+
+| | ns/op |
+|---|---|
+| `NaiveOrderBook` | 641 ± 227 |
+| `ArrayOrderBook` | **159 ± 53** |
+
+Roughly 4× — flat arrays and an O(1) cancel against a tree walk and an object
+per order.
+
+### The hash map, and a result that did not go as expected
+
+| | ns/op |
+|---|---|
+| `LongIntHashMap` | 52.3 ± 27.6 |
+| `HashMap<Long, Integer>` | 51.9 ± 7.7 |
+
+**No measurable throughput difference.** The premise the map was written on —
+that boxing every order reference would be visibly slower — does not survive
+contact with a throughput microbenchmark. Short-lived boxed `Long`s are bump-
+allocated in a TLAB and collected by a young-gen pass that costs almost nothing,
+and this benchmark's phase-separated put/get/remove loops are unusually
+cache-friendly.
+
+The map still earns its place, but not for the reason it was written. What it
+buys is **no garbage at all**, and that only shows up somewhere a throughput
+average cannot see — the latency tail. Which is the actual result below.
+
+### Latency
+
+Open-loop against a fixed schedule, 1.5M operations at a 200k/sec target
+against a book holding ~8,400 resting orders:
+
+| percentile | service time |
+|---|---|
+| p50 | 300 ns |
+| p90 | 500 ns |
+| p99 | 800 ns |
+| p99.9 | 6.2 µs |
+| p99.99 | 119 µs |
+
+`System.nanoTime()` costs ~68 ns per pair on this machine, so p50 is within a
+few multiples of the measurement floor and should be read as such.
+
+**Zero GC pauses across the entire measurement run**, and the same run survives
+under Epsilon GC — a collector that never reclaims anything — in a 512 MB heap:
+
+```bash
+./gradlew latencyEpsilon
+```
+
+That is the zero-allocation claim proven rather than asserted. A run that
+allocates in steady state dies with an `OutOfMemoryError`; this one finishes.
+
+**What the far tail is.** Response-time percentiles past p99 run into
+milliseconds, and with zero collector activity that is not this code — it is OS
+scheduling and safepoints on a shared desktop. Chasing it further means pinning
+the thread to an isolated core, which is a property of the deployment, not the
+engine. Stated rather than trimmed, because a benchmark that quietly drops its
+inconvenient percentiles is not a benchmark.
+
+**On coordinated omission.** The harness reports service time and response time
+side by side. Service time is the operation alone; response time is measured
+from the *intended* send time, so an operation delayed by the one before it
+carries that delay. A closed-loop harness — send, time, send the next when the
+last returns — cannot see this: when the system stalls, it stalls too and simply
+stops issuing the requests that would have been slow. The gap between those two
+columns is exactly the error a naive harness reports as success.
 
 ## References
 
