@@ -6,12 +6,26 @@ Nothing in this directory is committed — ITCH session files are multiple GB.
 ## Getting a session file
 
 Nasdaq publishes free sample TotalView-ITCH 5.0 files covering full trading
-days. They live on Nasdaq's public data server (`emi.nasdaq.com`, under the
-ITCH directory), named by date, e.g. `01302020.NASDAQ_ITCH50.gz`. Exact paths
-move around occasionally — if the link is stale, search for
-"NASDAQ TotalView-ITCH 5.0 sample file".
+days, at:
 
-Grab one day. One is enough for everything through Phase 6.
+    https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/
+
+Files are named by date, e.g. `01302020.NASDAQ_ITCH50.gz`. Fifteen sessions are
+posted, spanning 2018–2020. Verified sizes, compressed:
+
+| file | compressed |
+|---|---|
+| `12302019.NASDAQ_ITCH50.gz` | 3.28 GB |
+| `03272019.NASDAQ_ITCH50.gz` | 5.13 GB |
+| `01302020.NASDAQ_ITCH50.gz` | 5.21 GB |
+
+`12302019` is the smallest of the set and the cheapest one to start with — the
+day after Christmas is a thin session. Grab one day; one is enough for
+everything through Phase 6.
+
+```bash
+curl -o data/12302019.NASDAQ_ITCH50.gz   "https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/12302019.NASDAQ_ITCH50.gz"
+```
 
 ## Decompress before use
 
@@ -22,8 +36,9 @@ refuse a `.gz` with a message telling you so.
 gunzip data/01302020.NASDAQ_ITCH50.gz
 ```
 
-Expect roughly 5–12 GB decompressed depending on the date. Make sure you have
-the disk space before starting.
+Expect roughly 3-4x the compressed size once decompressed, so budget 12-20 GB
+free for the file plus the `.gz` alongside it. Delete the `.gz` after
+decompressing if space is tight.
 
 ## Run it
 

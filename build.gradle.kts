@@ -36,6 +36,12 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 
+    // The benchmark harness is on the test classpath so its workload generators
+    // can be tested. A generator that emits a different message count than the
+    // benchmark declares silently rescales every ns/op figure it produces, and
+    // nothing else in the build would catch that.
+    testImplementation(sourceSets["benchmarks"].output)
+
     benchmarksImplementation("org.openjdk.jmh:jmh-core:1.37")
     benchmarksImplementation("org.hdrhistogram:HdrHistogram:2.2.2")
     benchmarksAnnotationProcessor("org.openjdk.jmh:jmh-generator-annprocess:1.37")

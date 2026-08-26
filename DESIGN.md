@@ -89,7 +89,8 @@ Order reference lookup goes through `LongIntHashMap`.
 **This is where the design was wrong.** The map was written on the premise that
 boxing every order reference into a `Long` would be visibly slower, and that
 this would be the largest single win over Phase 2. Measured head to head against
-`HashMap<Long, Integer>`, it is 52.3 ns/op against 51.9 — no difference at all.
+`HashMap<Long, Integer>`, it is 21.4 ns/op against 22.4 — no difference at all,
+the gap being a fraction of the run-to-run error.
 Short-lived boxed `Long`s are bump-allocated in a TLAB and reclaimed by a
 young-gen pass that costs almost nothing, and a phase-separated
 put/get/remove benchmark is about as cache-friendly as that access pattern gets.
@@ -104,10 +105,10 @@ Measured, per operation over a balanced 200k-operation script:
 
 | | Phase 2 (naive) | Phase 3 (array) |
 |---|---|---|
-| ns/op | 641 ± 227 | **159 ± 53** |
+| ns/op | 512 ± 59 | **112 ± 56** |
 | GC pauses in steady state | many | **zero** |
 
-About 4x. The wide error bars are a single JMH fork; treat the ratio as
+About 4.6x. The wide error bars are a single JMH fork; treat the ratio as
 indicative rather than decisive.
 
 ## Phase 4 — matching engine ✅

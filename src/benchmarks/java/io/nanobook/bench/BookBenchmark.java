@@ -115,8 +115,9 @@ public class BookBenchmark {
         }
     }
 
+    // 100_000 keys, each visited by all three loops: put, get, remove.
     @Benchmark
-    @OperationsPerInvocation(100_000)
+    @OperationsPerInvocation(300_000)
     public void primitiveMapChurn(Keys state, Blackhole blackhole) {
         LongIntHashMap map = state.primitive;
         for (int i = 0; i < state.references.length; i++) {
@@ -131,7 +132,7 @@ public class BookBenchmark {
     }
 
     @Benchmark
-    @OperationsPerInvocation(100_000)
+    @OperationsPerInvocation(300_000)
     public void boxedMapChurn(Keys state, Blackhole blackhole) {
         Map<Long, Integer> map = state.boxed;
         for (int i = 0; i < state.references.length; i++) {

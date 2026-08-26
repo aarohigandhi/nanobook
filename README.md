@@ -205,8 +205,15 @@ cut to three operations usually names the bug.
 ## Benchmarks
 
 Measured on Windows 11, Snapdragon X 10-core (aarch64), Temurin JDK 21.0.5.
-JMH at 1 fork, 3×2s warmup, 5×2s measurement — below JMH's recommended fork
+JMH at 1 fork, 3×3s warmup, 5×3s measurement — below JMH's recommended fork
 count, so the error bars are wide and the numbers are indicative, not decisive.
+
+One "operation" is one book message for the book benchmarks, and one map call
+(put, get or remove) for the map benchmarks. Worth stating explicitly, because
+`@OperationsPerInvocation` is a compile-time constant that JMH trusts blindly:
+declare the wrong count and every ns/op figure is silently rescaled by the ratio
+while still looking entirely plausible. `MessageScriptTest` asserts the workload
+generator emits exactly the count the annotation claims.
 
 ```bash
 ./gradlew jmh
@@ -219,18 +226,19 @@ Replaying a balanced 200,000-operation lifecycle script, per operation:
 
 | | ns/op |
 |---|---|
-| `NaiveOrderBook` | 641 ± 227 |
-| `ArrayOrderBook` | **159 ± 53** |
+| `NaiveOrderBook` | 512 ± 59 |
+| `ArrayOrderBook` | **112 ± 56** |
 
-Roughly 4× — flat arrays and an O(1) cancel against a tree walk and an object
-per order.
+Roughly 4.6× — flat arrays and an O(1) cancel against a tree walk and an object
+per order. The fast book's error bar is half its own score, so read the ratio,
+not the digits.
 
 ### The hash map, and a result that did not go as expected
 
 | | ns/op |
 |---|---|
-| `LongIntHashMap` | 52.3 ± 27.6 |
-| `HashMap<Long, Integer>` | 51.9 ± 7.7 |
+| `LongIntHashMap` | 21.4 ± 18.3 |
+| `HashMap<Long, Integer>` | 22.4 ± 4.8 |
 
 **No measurable throughput difference.** The premise the map was written on —
 that boxing every order reference would be visibly slower — does not survive

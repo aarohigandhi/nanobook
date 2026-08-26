@@ -65,10 +65,34 @@ public final class MessageScript {
         List<Live> live = new ArrayList<>();
         long nextReference = 1;
 
-        for (int i = 0; i < target; i++) {
+        // Exactly `target` messages, drain included. Each iteration emits one
+        // message; an ADD also adds one order that the drain must later delete,
+        // so an ADD costs two of the budget and is only legal while two remain.
+        // Without this the script overran `target` by the length of its drain
+        // tail, and @OperationsPerInvocation -- a compile-time constant -- was
+        // dividing by a message count the script never actually had.
+        while (kinds.size() + live.size() < target) {
             int roll = random.nextInt(100);
+            int remaining = target - (kinds.size() + live.size());
+            boolean canAdd = remaining >= 2;
 
-            if (live.isEmpty() || roll < 52) {
+            // With one slot left, only a partial reduction fits. An ADD needs
+            // two (itself plus its drain delete), and a DELETE is budget-neutral
+            // -- it emits a message but retires one the drain owed, so the
+            // budget never moves and the loop spins until `live` empties. That
+            // spin was the off-by-one: it exited one message short.
+            if (remaining == 1) {
+                int index = indexOfDivisible(live);
+                if (index < 0) break;
+                Live order = live.get(index);
+                int reduction = order.shares() - 1;
+                live.set(index, new Live(order.reference(), 1));
+                append(kinds, references, prices, quantities, sides,
+                        CANCEL, order.reference(), 0, reduction);
+                continue;
+            }
+
+            if (canAdd && (live.isEmpty() || roll < 52)) {
                 long ref = nextReference++;
                 int qty = 100 * (1 + random.nextInt(20));
                 boolean side = random.nextBoolean();
@@ -80,7 +104,7 @@ public final class MessageScript {
                 quantities.add(qty);
                 sides.add(side);
                 live.add(new Live(ref, qty));
-            } else if (roll < 82) {
+            } else if (roll < 82 || !canAdd) {
                 Live order = live.remove(random.nextInt(live.size()));
                 append(kinds, references, prices, quantities, sides,
                         DELETE, order.reference(), 0, 0);
@@ -124,6 +148,14 @@ public final class MessageScript {
             script.buy[i] = sides.get(i);
         }
         return script;
+    }
+
+    /** First live order that can be partially reduced, or -1 if none can. */
+    private static int indexOfDivisible(List<Live> live) {
+        for (int i = 0; i < live.size(); i++) {
+            if (live.get(i).shares() >= 2) return i;
+        }
+        return -1;
     }
 
     private static void append(List<Byte> kinds, List<Long> references, List<Integer> prices,
