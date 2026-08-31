@@ -2,52 +2,40 @@
 
 A limit order book and matching engine in Java that never allocates.
 
-Reconstructs the Nasdaq order book from raw TotalView-ITCH 5.0 exchange data,
-then matches against it. The design constraint that drives everything here is
-**zero allocation on the hot path** — no garbage means no collector, and that is
-provable rather than assertable: the engine runs 1.5M operations under Epsilon
-GC, a collector that never reclaims anything, in a 512 MB heap.
+It reads raw Nasdaq TotalView-ITCH 5.0 files, rebuilds the order book, and
+matches against it. The design constraint is zero allocation on the hot path.
+No garbage means no collector, and that gets proven rather than claimed: the
+engine runs a full measurement pass under Epsilon GC, a collector that never
+reclaims anything, in a 512 MB heap.
 
-Built as a study of how exchange infrastructure actually works, with the
-performance claims measured instead of asserted — including the one that turned
-out to be wrong.
+Validated on a real session: 268,744,780 messages from 2019-12-30, 8.25 GB,
+parsed at 7.8M msg/s. That session also falsified one of the design's core
+assumptions, written up in [What real data broke](#what-real-data-broke).
 
-## Status
-
-| Phase | | |
-|---|---|---|
-| 1 | ITCH 5.0 feed handler | **done** |
-| 2 | Reference order book | **done** |
-| 3 | Array-backed order book | **done** |
-| 4 | Matching engine | **done** |
-| 5 | Differential fuzzer | **done** |
-| 6 | Benchmarks | **done** |
-
-72 tests. 15,000,000 fuzzed operations against an independent reference engine,
-zero divergences. Zero GC pauses across a 1.5M-operation measurement run, and
-the engine survives the same run under a collector that never reclaims.
+85 tests. 15M fuzzed operations against an independent reference engine, zero
+divergences.
 
 ## Running it
 
-Java 21+. No install step — the Gradle wrapper is committed.
+Java 21+. The Gradle wrapper is committed, so there is no install step.
 
 ```bash
 ./gradlew build
 ```
 
-Then fetch a session file (see [data/README.md](data/README.md)) and replay it:
+Fetch a session file (see [data/README.md](data/README.md)), then:
 
 ```bash
-./gradlew replay --args="data/01302020.NASDAQ_ITCH50"
+./gradlew replay --args="data/12302019.NASDAQ_ITCH50"
 ```
-
-To reconstruct one symbol's book across the whole session:
 
 ```bash
-./gradlew replay --args="data/01302020.NASDAQ_ITCH50 --book AAPL"
+./gradlew replay --args="data/12302019.NASDAQ_ITCH50 --book AAPL"
 ```
 
-## What is here
+Other tasks: `test`, `fuzz`, `jmh`, `latency`, `latencyEpsilon`, `replayEpsilon`.
+
+## Layout
 
 ```
 itch/         ITCH 5.0 wire format: layout table, parser, symbol interning
@@ -57,101 +45,126 @@ tools/        Message-mix statistics, book replay, differential fuzzer
 bench/        JMH microbenchmarks and the open-loop latency harness
 ```
 
-### Phase 1 — the feed handler
+## The feed handler
 
-The file is memory-mapped rather than streamed, so decoding reads straight out
-of the page cache with no copy and no syscall per message. Two details carry
-most of the work:
+The file is memory-mapped, so decoding reads out of the page cache with no copy
+and no syscall per message. Two details carry most of the work.
 
-**The 2 GiB problem.** A `MappedByteBuffer` is addressed by `int`, so a single
-mapping cannot exceed 2 GiB, and a session file is several times that. The
-parser slides a 1 GiB window and remaps — but a message must never straddle a
-boundary, so the next window starts at the first byte of the message that did
-not fit, not at the end of the previous one.
+**The 2 GiB problem.** A `MappedByteBuffer` is `int`-addressed, so one mapping
+caps at 2 GiB and a session file is several times that. The parser slides a
+1 GiB window. A message must never straddle a boundary, so the next window
+starts at the first byte of the message that did not fit, not at the end of the
+previous one.
 
-**Symbols are longs.** An ITCH stock field is exactly 8 bytes of right-padded
-ASCII, and a `long` is exactly 8 bytes. So the raw symbol *is* a long: one
-`getLong`, used directly as a hash key. No `String`, no `byte[]`, and symbol
-comparison is a single 64-bit compare rather than a character loop.
+**Symbols are longs.** An ITCH stock field is 8 bytes of right-padded ASCII, and
+a `long` is 8 bytes. So the symbol *is* a long: one `getLong`, used directly as
+a hash key. No `String`, no `byte[]`, and comparison is a single 64-bit compare.
 
-Decoded fields reach the handler as primitives. Nothing is allocated per
-message — at a few hundred million messages a day, one small object per message
-is tens of gigabytes of garbage.
+Decoded fields reach the handler as primitives. At a few hundred million
+messages a day, one small object per message is tens of gigabytes of garbage.
 
-### The message mix
+## The message mix
 
-The first real output is a histogram of message types, and it is the number
-that justifies the rest of the design:
+From the full 2019-12-30 session, 268,744,780 messages across 8,906 symbols:
+
+| message | count | share |
+|---|---:|---:|
+| `AddOrder` | 118,631,456 | 44.14% |
+| `OrderDelete` | 114,360,997 | 42.55% |
+| `OrderReplace` | 21,639,067 | 8.05% |
+| `OrderExecuted` | 5,722,824 | 2.13% |
+| `NetOrderImbalanceIndicator` | 4,024,315 | 1.50% |
+| `OrderCancel` | 2,787,676 | 1.04% |
+| `Trade` | 1,218,602 | 0.45% |
+| everything else | 359,843 | 0.13% |
+
+Order lifecycle traffic is **95.79%** of the session. Executions are **2.17%**.
+Adds and deletes nearly cancel out: 118.6M posted against 114.4M withdrawn.
+Most orders that reach the book never trade.
+
+So the hot path is order lifecycle, not matching. O(1) cancel-by-order-reference
+matters more than a clever matching loop, and that is what the fast book is
+built around. Tuning the matching loop would have tuned 2% of the traffic.
+
+## Rebuilding a real book
+
+`--book AAPL` over the same session:
 
 | | |
-|---|---|
-| Order lifecycle (add / cancel / delete / replace) | *TBD — fill from a real session* |
-| Executions | *TBD* |
+|---|---:|
+| top-of-book changes | 152,427 |
+| mean quoted spread | $0.0350 |
+| **locked or crossed quotes** | **0** |
+| **unknown order references** | **0** |
+| orders resting at close | 0 |
+| orders held off-band | 19 |
 
-Order lifecycle traffic dominates by a wide margin. Executions are comparatively
-rare. So the hot path is **order lifecycle, not matching** — which means O(1)
-cancel-by-order-reference matters far more than a clever matching loop, and
-that is what the fast book is built around.
+Zero unknown references across 268.7M messages means every delete, execution and
+replace resolved to an order the parser had already seen. One wrong field offset
+in the add path would have orphaned millions.
 
-### Why a hand-written hash map
+Zero locked or crossed quotes means the book never rested with a bid at or above
+the ask. That is the invariant a mis-repaired cached touch breaks first.
 
-`HashMap<Long, Order>` boxes every order reference into a `Long` and allocates
-a `Node` per entry, so a single order lookup costs two heap allocations and two
-dereferences into unrelated cache lines. Given the message mix above, that is
-squarely on the hot path — so replacing it should be a large throughput win.
+The $0.035 mean spread is the sanity check: about three and a half cents on a
+$289 stock, which is what AAPL traded at.
 
-It is not. That prediction is measured and refuted in
-[Benchmarks](#the-hash-map-and-a-result-that-did-not-go-as-expected) below; the
-map earns its place for a different reason than the one it was written for.
+## What real data broke
 
-`LongIntHashMap` is open-addressed with linear probing over two flat primitive
-arrays. Deletion uses **backward-shift** rather than tombstones: tombstones are
-simpler, but they accumulate permanently under churn, and an ITCH session is
-nothing but churn. Backward-shift repairs the probe chain on removal, so the
-table stays as clean as if the removed key had never been inserted.
+The tick-indexed level array is the core of the fast book, and the real session
+falsified the assumption behind it. AAPL's 698,744 add orders that day:
 
-Hashing is a Fibonacci mix rather than raw masking, because ITCH order
-references are sequential and sequential keys with a weak mixer collapse into
-one enormous probe run.
+| | ticks at tick=100 |
+|---|---:|
+| p1-p99 | 7,942 |
+| p0.1-p99.9 | 21,654 |
+| full range | 19,999,899 |
 
-### Phases 2 and 3 — two order books
+99.8% of the session fits in 21,654 ticks. The rest, sub-penny stink bids at
+$0.0001 and a sell at $199,999.00 against a $288.91 mean, drags the window to
+20 million ticks and 79 MB per side, for orders that never trade. Thirteen
+orders out of 698,744 killed the whole replay, because the original code treated
+an off-grid price as fatal.
 
-`NaiveOrderBook` is a `TreeMap` of price to a `LinkedList` of orders per side,
-with an `Order` object each and a `HashMap` for reference lookup. It is slow on
-purpose. It exists to be read and believed.
+No synthetic workload finds this. You do not generate a $199,999 order on a $289
+stock. The exchange does.
 
-`ArrayOrderBook` produces identical output with no objects at all. An order is
-an index into parallel primitive arrays, drawn from a free list threaded through
-`orderNext`. Price levels are indexed directly by tick offset from a base price
-— one array load instead of a red-black descent with a cache miss per node. The
-touch is cached and repaired incrementally: an add can only improve it, and a
-removal only triggers a scan when it empties the touch level.
+The window is now capped. An order that cannot be represented is held
+**off-band**: it keeps its slot and stays addressable by reference, so a later
+delete or execution still resolves, but it rests in no price level and never
+reaches the touch. The count is reported, since a silently dropped order looks
+identical to one parsed wrong.
 
-Prices far from the touch are legal and do occur, so the window regrows outward
-and copies its levels rather than rejecting them. Order prices are stored rather
-than tick indices precisely so that regrowing does not require touching every
-live order.
+## Two order books
 
-Keeping both is not redundancy. The slow one is the oracle the fast one is
-tested against, and a reference implementation you can read is worth more than
-the throughput it costs.
+`NaiveOrderBook` is a `TreeMap` of price to a `LinkedList` per side, an `Order`
+object each, and a `HashMap` for lookup. It is slow on purpose, and exists to be
+read and believed.
 
-### Phase 4 — matching engine
+`ArrayOrderBook` produces identical output with no objects. An order is an index
+into parallel primitive arrays, drawn from a free list threaded through
+`orderNext`. Price levels are indexed by tick offset, so finding one is an array
+load instead of a red-black descent with a cache miss per node. The touch is
+cached and repaired incrementally: an add can only improve it, and a removal
+only triggers a scan when it empties the touch level.
+
+The slow one is the oracle the fast one is tested against.
+
+## The matching engine
 
 Price-time priority, with limit, market, IOC and FOK orders. Fills print at the
-**maker's** resting price: the taker crossed the spread, so price improvement is
-theirs. A fill-or-kill is decided before anything is touched, so a rejected one
-leaves no partial fills to unwind.
+maker's resting price, since the taker crossed the spread. A fill-or-kill is
+decided before anything is touched, so a rejected one leaves no partial fills to
+unwind.
 
-A replacement is a genuinely new order — it joins the back of the queue and
-crosses if it is marketable. It does not inherit the original's position. That
-is why a trader reducing size cancels down instead of replacing, and it is the
-rule this kind of engine most often gets wrong.
+A replacement is a new order: it joins the back of the queue rather than
+inheriting the original's position. That is why a trader reducing size cancels
+down instead of replacing, and it is the rule this kind of engine most often
+gets wrong.
 
-The engine is deterministic by construction: nothing reads a clock, hashes an
-identity, or iterates a container with unspecified order. Same input, byte-
-identical execution report stream, every run. Phase 5 depends entirely on that
-holding, so there is a test that asserts it directly.
+The engine is deterministic. Nothing reads a clock, hashes an identity, or
+iterates a container with unspecified order, so the same input gives a
+byte-identical report stream. The fuzzer depends on that, and a test asserts it.
 
 ## Testing
 
@@ -159,143 +172,123 @@ holding, so there is a test that asserts it directly.
 ./gradlew test
 ```
 
-The parser tests encode messages byte by byte from the specification and assert
-on the decoded fields. This is deliberate: an offset that is wrong by two bytes
-still parses cleanly and produces plausible-looking prices and share counts. It
-would silently poison every downstream result, and only a round-trip test
-catches it.
+Parser tests encode messages byte by byte from the spec and assert on decoded
+fields. An offset wrong by two bytes still parses cleanly and produces plausible
+prices, so only a round-trip test catches it.
 
-The two order books are driven through identical randomized message streams and
-compared after every single message — best prices, sizes, depth and order count.
-The naive book is the oracle; any disagreement is a bug in the fast one. The
-hash map gets the same treatment against `java.util.HashMap`.
+The two books are driven through identical randomized streams and compared after
+every message. The hash map gets the same treatment against `java.util.HashMap`.
 
-The engine has an invariant test that asserts the book never rests crossed: any
-bid at or above the best ask should have matched instead of resting, and a
-cached touch that is repaired incorrectly shows up there first.
+### Differential fuzzer
 
-### Phase 5 — differential fuzzer
+`ReferenceMatchingEngine` is a second, deliberately naive engine sharing no code
+with the fast one. The fuzzer generates random sequences, runs both, and
+compares execution report streams.
 
-`ReferenceMatchingEngine` is a second, deliberately naive engine that shares no
-code with the fast one. The fuzzer generates random order sequences, runs both,
-and compares **execution report streams**.
+Report streams rather than final book state. Two engines can reach an identical
+resting book having filled orders in a different order, at different prices,
+against different counterparties.
 
-Report streams rather than final book state, deliberately. Comparing books is
-the obvious thing and it is much weaker: two engines can reach an identical
-resting book having filled the orders in a different order, at different prices,
-against different counterparties. The report stream is what a downstream
-consumer would actually act on.
+About one generated operation in twelve is malformed: zero and negative
+quantities, non-positive prices, ids already resting, references that never
+existed. Validation paths are where implementations drift apart, and a generator
+emitting only valid orders never visits them.
 
-The generator is hostile on purpose — roughly one operation in twelve is
-malformed (zero and negative quantities, non-positive prices, ids already
-resting, references that never existed, prices far outside the tick window).
-Validation and rejection paths are where two implementations drift apart, and a
-generator that only emits valid orders never visits them.
-
-A divergence is **shrunk** by delta debugging before it is reported, and repros
-print as pasteable Java. A 500-operation failure is a haystack; the same failure
-cut to three operations usually names the bug.
+Divergences are shrunk by delta debugging, and repros print as pasteable Java.
 
 ```bash
 ./gradlew fuzz --args="30000 500"
 ```
 
-**Result: 30,000 sequences, 15,000,000 operations, zero divergences.**
+30,000 sequences, 15,000,000 operations, zero divergences, 16.5s.
 
 ## Benchmarks
 
-Measured on Windows 11, Snapdragon X 10-core (aarch64), Temurin JDK 21.0.5.
-JMH at 1 fork, 3×3s warmup, 5×3s measurement — below JMH's recommended fork
-count, so the error bars are wide and the numbers are indicative, not decisive.
+Windows 11, Snapdragon X 10-core (aarch64), Temurin 21.0.5. JMH at 3 forks,
+3x3s warmup, 5x3s measurement.
 
-One "operation" is one book message for the book benchmarks, and one map call
-(put, get or remove) for the map benchmarks. Worth stating explicitly, because
-`@OperationsPerInvocation` is a compile-time constant that JMH trusts blindly:
-declare the wrong count and every ns/op figure is silently rescaled by the ratio
-while still looking entirely plausible. `MessageScriptTest` asserts the workload
-generator emits exactly the count the annotation claims.
-
-```bash
-./gradlew jmh
-./gradlew latency
-```
+One operation is one book message, or one map call.
+`@OperationsPerInvocation` is a compile-time constant JMH trusts blindly, so
+`MessageScriptTest` asserts the workload generator emits exactly the declared
+count. It did not, once, and every ns/op figure was silently rescaled by the
+ratio.
 
 ### Book throughput
 
-Replaying a balanced 200,000-operation lifecycle script, per operation:
-
 | | ns/op |
 |---|---|
-| `NaiveOrderBook` | 512 ± 59 |
-| `ArrayOrderBook` | **112 ± 56** |
+| `NaiveOrderBook` | 748 +/- 323 |
+| `ArrayOrderBook` | **119 +/- 14** |
 
-Roughly 4.6× — flat arrays and an O(1) cancel against a tree walk and an object
-per order. The fast book's error bar is half its own score, so read the ratio,
-not the digits.
+Roughly 6x. The naive book's error bar is 43% of its own score, which is the
+result rather than a measurement failure: it allocates, so GC lands
+unpredictably inside the measurement. The array book's error is 12%.
 
-### The hash map, and a result that did not go as expected
+### The hash map, and why the benchmark decides the answer
 
-| | ns/op |
-|---|---|
-| `LongIntHashMap` | 21.4 ± 18.3 |
-| `HashMap<Long, Integer>` | 22.4 ± 4.8 |
+`HashMap<Long, Order>` boxes every order reference and allocates a `Node` per
+entry. Replacing it with an open-addressed primitive map should be a large
+throughput win. Whether it is depends entirely on which benchmark you run.
 
-**No measurable throughput difference.** The premise the map was written on —
-that boxing every order reference would be visibly slower — does not survive
-contact with a throughput microbenchmark. Short-lived boxed `Long`s are bump-
-allocated in a TLAB and collected by a young-gen pass that costs almost nothing,
-and this benchmark's phase-separated put/get/remove loops are unusually
-cache-friendly.
+| | `LongIntHashMap` | `HashMap<Long, Integer>` |
+|---|---|---|
+| phase-separated churn | 28.9 +/- 0.7 | **20.5 +/- 1.4** |
+| interleaved, ITCH-like | **56.8 +/- 5.4** | 75.8 +/- 22.1 |
 
-The map still earns its place, but not for the reason it was written. What it
-buys is **no garbage at all**, and that only shows up somewhere a throughput
-average cannot see — the latency tail. Which is the actual result below.
+The first fills the map, reads it all back, then empties it. That is the worst
+case for backward-shift deletion specifically, because bulk removal means every
+removal repairs a cluster the next one disturbs again. There the boxed
+`HashMap` wins by 40%.
+
+The second interleaves adds, lookups and cancels at constant depth, which is
+what the message mix above says actually happens. There the primitive map wins
+by 25%, with an error bar four times tighter, because boxing allocates and GC
+lands unpredictably.
+
+The map was originally justified on throughput, and that justification was a
+guess. What it reliably buys is no garbage, which shows up in the latency tail
+rather than in a throughput average.
 
 ### Latency
 
-Open-loop against a fixed schedule, 1.5M operations at a 200k/sec target
-against a book holding ~8,400 resting orders:
+Open-loop against a fixed schedule, 1.5M operations at 200k/sec, book holding
+~8,400 resting orders.
 
-| percentile | service time |
-|---|---|
-| p50 | 300 ns |
-| p90 | 500 ns |
-| p99 | 800 ns |
-| p99.9 | 6.2 µs |
-| p99.99 | 119 µs |
+| percentile | service (ns) | response (ns) |
+|---|---:|---:|
+| p50 | 300 | 500 |
+| p90 | 600 | 13,703 |
+| p99 | 1,200 | 8,970,239 |
+| p99.9 | 12,007 | 39,354,367 |
+| p99.99 | 134,015 | 42,860,543 |
+| max | 16,203,775 | 43,515,903 |
 
-`System.nanoTime()` costs ~68 ns per pair on this machine, so p50 is within a
-few multiples of the measurement floor and should be read as such.
-
-**Zero GC pauses across the entire measurement run**, and the same run survives
-under Epsilon GC — a collector that never reclaims anything — in a 512 MB heap:
+**Zero GC pauses across the entire run**, and the same run survives under
+Epsilon GC in a 512 MB heap:
 
 ```bash
 ./gradlew latencyEpsilon
 ```
 
-That is the zero-allocation claim proven rather than asserted. A run that
-allocates in steady state dies with an `OutOfMemoryError`; this one finishes.
+A run that allocates in steady state dies with an `OutOfMemoryError`. This one
+finishes. That is the zero-allocation claim proven rather than asserted.
 
-**What the far tail is.** Response-time percentiles past p99 run into
-milliseconds, and with zero collector activity that is not this code — it is OS
-scheduling and safepoints on a shared desktop. Chasing it further means pinning
-the thread to an isolated core, which is a property of the deployment, not the
-engine. Stated rather than trimmed, because a benchmark that quietly drops its
-inconvenient percentiles is not a benchmark.
+`System.nanoTime()` costs ~68 ns per pair here, so p50 sits within a few
+multiples of the measurement floor.
 
-**On coordinated omission.** The harness reports service time and response time
-side by side. Service time is the operation alone; response time is measured
-from the *intended* send time, so an operation delayed by the one before it
-carries that delay. A closed-loop harness — send, time, send the next when the
-last returns — cannot see this: when the system stalls, it stalls too and simply
-stops issuing the requests that would have been slow. The gap between those two
-columns is exactly the error a naive harness reports as success.
+Service time is the operation alone. Response time is measured from the intended
+send time, so an operation delayed by the one before it carries that delay. A
+closed-loop harness cannot see this: when the system stalls it stalls too and
+stops issuing the requests that would have been slow. The gap between the two
+columns is that error. Here 10.5% of operations missed their slot.
+
+The far tail is not this code. With zero collector activity, a 16 ms max is OS
+scheduling and safepoints on a shared desktop. Stated rather than trimmed.
 
 ## References
 
 - Nasdaq, *TotalView-ITCH 5.0* specification
-- Gil Tene, *How NOT to Measure Latency* — on coordinated omission
+- Gil Tene, *How NOT to Measure Latency*, on coordinated omission
 
 ## License
 

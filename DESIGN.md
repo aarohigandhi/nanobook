@@ -87,29 +87,82 @@ scan when the touch level empties, and then only outward, one tick at a time.
 Order reference lookup goes through `LongIntHashMap`.
 
 **This is where the design was wrong.** The map was written on the premise that
-boxing every order reference into a `Long` would be visibly slower, and that
-this would be the largest single win over Phase 2. Measured head to head against
-`HashMap<Long, Integer>`, it is 21.4 ns/op against 22.4 — no difference at all,
-the gap being a fraction of the run-to-run error.
-Short-lived boxed `Long`s are bump-allocated in a TLAB and reclaimed by a
-young-gen pass that costs almost nothing, and a phase-separated
-put/get/remove benchmark is about as cache-friendly as that access pattern gets.
+boxing every order reference would be visibly slower, and that this would be the
+largest single win over Phase 2. Whether it is depends entirely on which
+benchmark you run, which was not the answer the premise expected.
 
-The map stays, but the justification changes. What it actually buys is that it
-produces **no garbage**, and that pays off somewhere a throughput average
-cannot see: the latency tail, and the ability to run the whole engine under a
-collector that never reclaims. The original reasoning was a guess that happened
-to reach a defensible structure for the wrong reason.
+| 3 forks, 15 iterations | LongIntHashMap | HashMap<Long, Integer> |
+|---|---|---|
+| phase-separated churn | 28.9 +/- 0.7 | **20.5 +/- 1.4** |
+| interleaved, ITCH-like | **56.8 +/- 5.4** | 75.8 +/- 22.1 |
+
+The phase-separated benchmark fills the map, reads it all back, then empties it.
+That is the worst case for backward-shift deletion specifically: bulk removal
+means every removal repairs a cluster the next one immediately disturbs. There
+the boxed HashMap wins by 40%.
+
+The interleaved benchmark holds a constant depth and mixes adds, lookups and
+cancels, which is what the message mix says a session actually does. There the
+primitive map wins by 25%, with an error bar four times tighter.
+
+Both were run at 1 fork first, and at 1 fork they looked identical: the gap sat
+inside the noise. Three forks separated them. A microbenchmark at 1 fork is a
+hypothesis, not a measurement.
+
+The map stays, and the justification changes. What it reliably buys is **no
+garbage**, which shows up where a throughput average cannot see it: the latency
+tail, and the ability to run the engine under a collector that never reclaims.
 
 Measured, per operation over a balanced 200k-operation script:
 
 | | Phase 2 (naive) | Phase 3 (array) |
 |---|---|---|
-| ns/op | 512 ± 59 | **112 ± 56** |
+| ns/op | 748 +/- 323 | **119 +/- 14** |
 | GC pauses in steady state | many | **zero** |
 
-About 4.6x. The wide error bars are a single JMH fork; treat the ratio as
-indicative rather than decisive.
+About 6x. The naive book error bar is 43% of its own score, and that is the
+result rather than a measurement failure: it allocates, so GC lands
+unpredictably inside the measurement.
+
+### The band, and what real data did to it
+
+A tick-indexed array addresses prices on a grid, inside a window. Real sessions
+contain orders that satisfy neither, and the first run against a live file
+crashed on one: `price 2610 is not a multiple of tickSize 100`.
+
+It was not a parser bug. AAPL's locate resolved correctly — 698,744 add orders,
+mean price $288.91, which is what AAPL traded at on 2019-12-30. The order was
+real: a stink bid at $0.2610. Twelve more like it, plus a sell at $199,999.00.
+
+| AAPL add-order prices, 2019-12-30 | ticks at tick=100 |
+|---|---:|
+| p1–p99 | 7,942 |
+| p0.1–p99.9 | 21,654 |
+| full range | 19,999,899 |
+
+Covering everything costs 79 MB per side to hold 0.002% of the traffic, none of
+which can ever trade. Three options:
+
+- **Throw.** The original behaviour. Thirteen orders killed a 268M-message
+  replay.
+- **Round to the nearest tick.** Worst of the three: it corrupts the book while
+  leaving it plausible, and nothing downstream can tell.
+- **Cap the window and hold the remainder off-band.** Chosen.
+
+An off-band order keeps its slot and its entry in `slotByReference`, so a later
+delete, execution or replace resolves normally. It is linked into no level and
+cannot become the touch. `offBandOrders()` is cumulative over the life of the
+book and is printed by the replay, because an order silently dropped is
+indistinguishable from an order parsed wrong.
+
+The cap check computes the required window in `long` arithmetic deliberately.
+`$199,999` against a `$289` book overflows `int` at exactly the point the check
+matters, and an overflowed span compares as negative — which would pass the
+cap and then attempt the allocation anyway.
+
+`NaiveOrderBook` has no band, because a `TreeMap` needs no window. That is a
+real difference between the oracle and the fast book, and it is confined to
+prices the fast book documents as unrepresentable.
 
 ## Phase 4 — matching engine ✅
 
