@@ -145,4 +145,123 @@ public class BookBenchmark {
             blackhole.consume(map.remove(reference));
         }
     }
+
+    // ---------------------------------------------------------------
+    // The same two maps, on the access pattern they actually see
+    // ---------------------------------------------------------------
+
+    /**
+     * The churn benchmarks above are phase-separated: fill the map, read it all
+     * back, then empty it. That is not what an ITCH session does, and it is the
+     * worst case for backward-shift deletion specifically -- removing keys in
+     * bulk means every removal repairs a cluster that the next removal is about
+     * to disturb again.
+     *
+     * <p>Real traffic interleaves. The book holds a roughly constant number of
+     * live orders and each message adds one, drops one, or looks one up. This
+     * state replays exactly that, over a fixed key universe so the map ends each
+     * invocation holding precisely the keys it started with.
+     */
+    @State(Scope.Thread)
+    public static class Interleaved {
+        static final byte PUT = 0;
+        static final byte GET = 1;
+        static final byte REMOVE = 2;
+
+        /** Resting orders held at steady state. */
+        static final int DEPTH = 100_000;
+        static final int OPERATIONS = 300_000;
+
+        byte[] kind;
+        long[] key;
+        long[] universe;
+
+        LongIntHashMap primitive;
+        Map<Long, Integer> boxed;
+
+        @Setup(Level.Iteration)
+        public void setUp() {
+            Random random = new Random(11L);
+            universe = new long[DEPTH];
+            for (int i = 0; i < DEPTH; i++) {
+                // Sequential with gaps, as ITCH order references are.
+                universe[i] = i * 3L + random.nextInt(3);
+            }
+
+            kind = new byte[OPERATIONS];
+            key = new long[OPERATIONS];
+
+            long[] live = universe.clone();
+            int liveCount = DEPTH;
+            long[] removed = new long[DEPTH];
+            int removedCount = 0;
+            int n = 0;
+
+            // A REMOVE costs two of the budget: itself, plus the PUT that must
+            // restore the key before the script ends. Same accounting as
+            // MessageScript, and the same reason -- the declared operation
+            // count has to be the count actually replayed.
+            while (n + removedCount < OPERATIONS) {
+                int remaining = OPERATIONS - (n + removedCount);
+                int roll = random.nextInt(100);
+
+                if (remaining >= 2 && roll < 45 && liveCount > 0) {
+                    int index = random.nextInt(liveCount);
+                    kind[n] = REMOVE;
+                    key[n++] = live[index];
+                    removed[removedCount++] = live[index];
+                    live[index] = live[--liveCount];
+                } else if (roll < 90 && removedCount > 0) {
+                    long restored = removed[--removedCount];
+                    kind[n] = PUT;
+                    key[n++] = restored;
+                    live[liveCount++] = restored;
+                } else {
+                    kind[n] = GET;
+                    key[n++] = live[random.nextInt(liveCount)];
+                }
+            }
+            while (removedCount > 0) {
+                long restored = removed[--removedCount];
+                kind[n] = PUT;
+                key[n++] = restored;
+            }
+            if (n != OPERATIONS) {
+                throw new IllegalStateException("script is " + n + ", declared " + OPERATIONS);
+            }
+
+            primitive = new LongIntHashMap(DEPTH);
+            boxed = new HashMap<>(DEPTH * 2);
+            for (int i = 0; i < DEPTH; i++) {
+                primitive.put(universe[i], i);
+                boxed.put(universe[i], i);
+            }
+        }
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(Interleaved.OPERATIONS)
+    public void primitiveMapInterleaved(Interleaved state, Blackhole blackhole) {
+        LongIntHashMap map = state.primitive;
+        for (int i = 0; i < state.kind.length; i++) {
+            switch (state.kind[i]) {
+                case Interleaved.PUT -> blackhole.consume(map.put(state.key[i], i));
+                case Interleaved.GET -> blackhole.consume(map.get(state.key[i]));
+                default -> blackhole.consume(map.remove(state.key[i]));
+            }
+        }
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(Interleaved.OPERATIONS)
+    public void boxedMapInterleaved(Interleaved state, Blackhole blackhole) {
+        Map<Long, Integer> map = state.boxed;
+        for (int i = 0; i < state.kind.length; i++) {
+            switch (state.kind[i]) {
+                case Interleaved.PUT -> blackhole.consume(map.put(state.key[i], i));
+                case Interleaved.GET -> blackhole.consume(map.get(state.key[i]));
+                default -> blackhole.consume(map.remove(state.key[i]));
+            }
+        }
+    }
 }

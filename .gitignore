@@ -18,6 +18,7 @@ data/*
 # Benchmark output - numbers live in README.md and DESIGN.md, raw files go stale
 *.hgrm
 jmh-result.*
+jmh-*.text
 results/
 
 # IDE

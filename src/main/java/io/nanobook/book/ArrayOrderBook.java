@@ -37,12 +37,27 @@ import java.util.Arrays;
  * one tick at a time.
  *
  * <h2>Limitation</h2>
- * Prices must be a multiple of {@code tickSize}. The default of 100 raw ITCH
- * units is one cent, which is right for any stock above $1.00. Sub-dollar names
- * quote in sub-pennies and need {@code tickSize = 1} and a correspondingly
- * larger window. A misaligned price throws rather than rounding, because
- * silently snapping a price to a tick would corrupt the book in a way that
- * still looks plausible.
+ * <h2>The representable band</h2>
+ * A tick-indexed array can only address prices on the tick grid, within a
+ * bounded window. Real sessions contain orders that satisfy neither. Measured
+ * over AAPL on 2019-12-30: 698,744 add orders, of which 13 carry sub-penny
+ * prices ($0.0001, $0.2610) and the maximum is $199,999.00 against a $288.91
+ * mean. 99.8% of the session fits in 21,654 ticks; covering the full range
+ * needs 19,999,899, which is 79 MB per side to hold a handful of orders that
+ * never trade.
+ *
+ * <p>So the window is capped, and an order that cannot be represented -- off
+ * the tick grid, or outside the cap -- is held <b>off-band</b>: it occupies an
+ * order slot and stays addressable by reference, so a later delete, execute or
+ * replace resolves correctly, but it is not linked into any price level and
+ * never participates in the touch. {@link #offBandOrders()} reports how many
+ * there were, because silently dropping them would be indistinguishable from
+ * parsing them wrong.
+ *
+ * <p>Rounding to the nearest tick was the other option and is worse: it would
+ * corrupt the book in a way that still looks plausible. Throwing was the
+ * original behaviour and is worse still -- 0.002% of a real session killed the
+ * entire replay.
  */
 public final class ArrayOrderBook implements OrderBook {
 
@@ -55,12 +70,23 @@ public final class ArrayOrderBook implements OrderBook {
     private static final int BID = 0;
     private static final int ASK = 1;
 
+    /** Returned by {@link #ensureTick} for a price the level array cannot hold. */
+    private static final int OFF_BAND = Integer.MIN_VALUE;
+
     private static final int DEFAULT_TICK_SIZE = 100;      // one cent, in ITCH units
     private static final int DEFAULT_LEVEL_CAPACITY = 1 << 16;
     private static final int DEFAULT_ORDER_CAPACITY = 1 << 16;
 
+    /**
+     * Ceiling on window growth: 2,097,152 ticks, a $20,971 span at penny ticks.
+     * Wide enough that no ordinary price drift reaches it, small enough that the
+     * junk tail cannot force a 79 MB allocation.
+     */
+    private static final int DEFAULT_MAX_LEVEL_CAPACITY = 1 << 21;
+
     private final int stockLocate;
     private final int tickSize;
+    private final int maxLevelCapacity;
 
     // --- price levels, one set per side, indexed by tick ---------------
     private int[] bidHead;
@@ -84,6 +110,7 @@ public final class ArrayOrderBook implements OrderBook {
     private int[] orderNext;
     private int[] orderPrev;
     private byte[] orderSide;
+    private boolean[] orderOffBand;
 
     private int freeHead = NIL;
     private int liveOrders;
@@ -92,6 +119,7 @@ public final class ArrayOrderBook implements OrderBook {
 
     private long unknownReferences;
     private long levelRegrowths;
+    private long offBandOrders;
 
     public ArrayOrderBook() {
         this(ANY_STOCK, DEFAULT_TICK_SIZE, DEFAULT_LEVEL_CAPACITY, DEFAULT_ORDER_CAPACITY);
@@ -102,6 +130,11 @@ public final class ArrayOrderBook implements OrderBook {
     }
 
     public ArrayOrderBook(int stockLocate, int tickSize, int levelCapacity, int orderCapacity) {
+        this(stockLocate, tickSize, levelCapacity, orderCapacity, DEFAULT_MAX_LEVEL_CAPACITY);
+    }
+
+    public ArrayOrderBook(int stockLocate, int tickSize, int levelCapacity, int orderCapacity,
+                          int maxLevelCapacity) {
         if (tickSize <= 0) throw new IllegalArgumentException("tickSize must be positive");
         if (levelCapacity <= 1) throw new IllegalArgumentException("levelCapacity too small");
         if (orderCapacity <= 1) throw new IllegalArgumentException("orderCapacity too small");
@@ -109,6 +142,8 @@ public final class ArrayOrderBook implements OrderBook {
         this.stockLocate = stockLocate;
         this.tickSize = tickSize;
         this.levelCapacity = Integer.highestOneBit(levelCapacity - 1) << 1;
+        this.maxLevelCapacity = Math.max(this.levelCapacity,
+                Integer.highestOneBit(Math.max(maxLevelCapacity, 2) - 1) << 1);
 
         allocateLevels(this.levelCapacity);
 
@@ -119,6 +154,7 @@ public final class ArrayOrderBook implements OrderBook {
         this.orderNext = new int[slots];
         this.orderPrev = new int[slots];
         this.orderSide = new byte[slots];
+        this.orderOffBand = new boolean[slots];
         this.slotByReference = new LongIntHashMap(slots);
         buildFreeList(0, slots);
     }
@@ -220,6 +256,17 @@ public final class ArrayOrderBook implements OrderBook {
         orderShares[slot] = shares;
         orderSide[slot] = (byte) (buy ? BID : ASK);
         orderNext[slot] = NIL;
+        orderOffBand[slot] = tick == OFF_BAND;
+
+        if (tick == OFF_BAND) {
+            // Addressable by reference so a later delete or execute resolves,
+            // but in no price level and invisible to the touch.
+            orderPrev[slot] = NIL;
+            slotByReference.put(reference, slot);
+            liveOrders++;
+            offBandOrders++;
+            return;
+        }
 
         int[] head = buy ? bidHead : askHead;
         int[] tail = buy ? bidTail : askTail;
@@ -263,6 +310,7 @@ public final class ArrayOrderBook implements OrderBook {
             return;
         }
         orderShares[slot] = remaining;
+        if (orderOffBand[slot]) return;
         boolean buy = orderSide[slot] == BID;
         int tick = tickOf(orderPrice[slot]);
         if (buy) {
@@ -274,6 +322,13 @@ public final class ArrayOrderBook implements OrderBook {
 
     /** Removes a slot from its level and returns it to the free list. */
     void unlink(int slot) {
+        if (orderOffBand[slot]) {
+            orderOffBand[slot] = false;
+            slotByReference.remove(orderId[slot]);
+            liveOrders--;
+            releaseSlot(slot);
+            return;
+        }
         boolean buy = orderSide[slot] == BID;
         int tick = tickOf(orderPrice[slot]);
 
@@ -310,6 +365,21 @@ public final class ArrayOrderBook implements OrderBook {
                 bestAskTick = scanUp(tick + 1);
             }
         }
+    }
+
+    /**
+     * Orders the level array declined because their price was off the tick grid
+     * or outside the window cap. They stay addressable by reference and are
+     * counted in {@link #orderCount()} while they rest, but sit in no price
+     * level and never reach the touch.
+     *
+     * <p><b>Cumulative over the life of the book</b>, not a live gauge: this
+     * answers "how much of the session could this structure not represent",
+     * which is the number worth reporting after a replay. It does not decrease
+     * when an off-band order is deleted.
+     */
+    public long offBandOrders() {
+        return offBandOrders;
     }
 
     private int scanDown(int from) {
@@ -355,6 +425,7 @@ public final class ArrayOrderBook implements OrderBook {
         orderNext = Arrays.copyOf(orderNext, grown);
         orderPrev = Arrays.copyOf(orderPrev, grown);
         orderSide = Arrays.copyOf(orderSide, grown);
+        orderOffBand = Arrays.copyOf(orderOffBand, grown);
         buildFreeList(previous, grown);
     }
 
@@ -373,9 +444,7 @@ public final class ArrayOrderBook implements OrderBook {
     /** Maps a price to a tick, establishing or regrowing the window as needed. */
     private int ensureTick(int price) {
         if (price % tickSize != 0) {
-            throw new IllegalArgumentException(
-                    "price " + price + " is not a multiple of tickSize " + tickSize
-                            + " -- sub-penny symbols need tickSize = 1");
+            return OFF_BAND;
         }
         if (!based) {
             // Centre the initial window on the first price seen.
@@ -384,10 +453,31 @@ public final class ArrayOrderBook implements OrderBook {
         }
         int tick = (price - basePrice) / tickSize;
         if (tick < 0 || tick >= levelCapacity) {
+            if (requiredCapacity(price) > maxLevelCapacity) {
+                return OFF_BAND;
+            }
             regrow(price);
             tick = (price - basePrice) / tickSize;
         }
         return tick;
+    }
+
+    /**
+     * Window size that covering {@code price} alongside the current window would
+     * demand, matching the doubling {@link #regrow} performs. Computed in long
+     * arithmetic: a price like $199,999 against a $289 book overflows int here,
+     * and an overflowed span compares as negative and passes the cap check.
+     */
+    private long requiredCapacity(int price) {
+        long lowPrice = Math.min(basePrice, price);
+        long highPrice = Math.max((long) basePrice + (long) (levelCapacity - 1) * tickSize, price);
+        long span = (highPrice - lowPrice) / tickSize + 1;
+        long grown = levelCapacity;
+        while (grown < span * 2) {
+            grown <<= 1;
+            if (grown > Integer.MAX_VALUE) return Long.MAX_VALUE;
+        }
+        return grown;
     }
 
     /**

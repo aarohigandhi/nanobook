@@ -152,6 +152,12 @@ public final class BookReplay implements ItchHandler {
         out.printf("  %-28s %14s%n", "orders resting at close", group(book.orderCount()));
         out.printf("  %-28s %14s%n", "unknown order refs", group(book.unknownReferences()));
         out.printf("  %-28s %14s%n", "price window regrowths", group(book.levelRegrowths()));
+        out.printf("  %-28s %14s%n", "orders held off-band", group(book.offBandOrders()));
+        if (book.offBandOrders() > 0) {
+            out.println("  ^ prices off the tick grid or beyond the window cap. Kept");
+            out.println("    addressable by reference so deletes and executions still");
+            out.println("    resolve, but resting in no level and never in the touch.");
+        }
 
         out.println();
         out.println("  closing book");

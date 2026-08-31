@@ -26,8 +26,13 @@ public final class Main {
                               See data/README.md for where to get one.
               --book TICKER   also reconstruct the order book for TICKER.
               --tick UNITS    price tick in raw ITCH units. Default 100, which
-                              is one cent. Sub-dollar symbols quote in
-                              sub-pennies and need 1.
+                              is one cent and correct for any stock above $1.
+                              Sub-dollar symbols quote in sub-pennies and need
+                              1. Do not reach for 1 just because a session
+                              reports off-band orders: real sessions carry a
+                              few junk prices ($0.0001 on a $289 stock), and a
+                              tick of 1 would widen the window by 100x to hold
+                              orders that never trade.
 
             examples:
               ./gradlew replay --args="data/01302020.NASDAQ_ITCH50"

@@ -223,12 +223,54 @@ class OrderBookEquivalenceTest {
     }
 
     @Test
-    void rejectsPricesOffTheTickGrid() {
+    void holdsPricesOffTheTickGridOffBand() {
         ArrayOrderBook array = new ArrayOrderBook();
-        IllegalArgumentException error = org.junit.jupiter.api.Assertions.assertThrows(
-                IllegalArgumentException.class,
-                () -> array.onAddOrder(TS, LOCATE, 1, true, 100, SYMBOL, 10_050 + 7));
-        assertTrue(error.getMessage().contains("tickSize"), error.getMessage());
+        array.onAddOrder(TS, LOCATE, 1, true, 100, SYMBOL, 10_000);
+        array.onAddOrder(TS, LOCATE, 2, true, 100, SYMBOL, 10_050 + 7);
+
+        // Present and addressable, but in no level and invisible to the touch.
+        assertEquals(2, array.orderCount());
+        assertEquals(1, array.offBandOrders());
+        assertEquals(10_000, array.bestBid(),
+                "an off-grid price must not become the touch");
+
+        // Still resolvable by reference, which is the whole point of keeping it.
+        array.onOrderDelete(TS, LOCATE, 2);
+        assertEquals(1, array.orderCount());
+        assertEquals(10_000, array.bestBid());
+    }
+
+    @Test
+    void holdsPricesBeyondTheWindowCapOffBand() {
+        // Cap the window at 1,024 ticks so the far price cannot be reached by
+        // regrowth. $199,999 against a $289 book is the real case this models.
+        ArrayOrderBook array = new ArrayOrderBook(LOCATE, 100, 256, 256, 1_024);
+        array.onAddOrder(TS, LOCATE, 1, false, 100, SYMBOL, 2_890_000);
+        array.onAddOrder(TS, LOCATE, 2, false, 100, SYMBOL, 1_999_990_000);
+
+        assertEquals(2, array.orderCount());
+        assertEquals(1, array.offBandOrders());
+        assertEquals(2_890_000, array.bestAsk());
+
+        array.onOrderDelete(TS, LOCATE, 2);
+        assertEquals(1, array.orderCount());
+        assertEquals(1, array.offBandOrders(),
+                "the counter is cumulative: it records that the session contained "
+                        + "an unrepresentable order, and deleting it does not undo that");
+    }
+
+    @Test
+    void executesAndReducesOffBandOrders() {
+        ArrayOrderBook array = new ArrayOrderBook();
+        array.onAddOrder(TS, LOCATE, 1, true, 500, SYMBOL, 10_050 + 7);
+        assertEquals(1, array.offBandOrders());
+
+        array.onOrderCancel(TS, LOCATE, 1, 200);
+        assertEquals(1, array.orderCount(), "a partial cancel leaves it resting");
+
+        array.onOrderExecuted(TS, LOCATE, 1, 300, 1L);
+        assertEquals(0, array.orderCount(), "filling the remainder retires it");
+        assertEquals(OrderBook.NO_PRICE, array.bestBid());
     }
 
     // ---------------------------------------------------------------
