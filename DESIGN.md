@@ -160,6 +160,13 @@ The cap check computes the required window in `long` arithmetic deliberately.
 matters, and an overflowed span compares as negative — which would pass the
 cap and then attempt the allocation anyway.
 
+Two real symbols bracket the behaviour. `AAPL` at $288.91 needs the penny grid
+and puts 19 orders of 698,744 off-band. `AAU` at $0.7092 quotes 98.5% sub-penny,
+so at the default tick it puts 6,222 of 6,265 off-band and reconstructs almost
+nothing, with the count saying exactly that; at `--tick 1` it drops to 1
+off-band and 1,448 top-of-book changes. Wrong tick degrades and reports rather
+than failing, which is the property the change was for.
+
 `NaiveOrderBook` has no band, because a `TreeMap` needs no window. That is a
 real difference between the oracle and the fast book, and it is confined to
 prices the fast book documents as unrepresentable.

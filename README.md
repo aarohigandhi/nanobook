@@ -4,15 +4,15 @@ A limit order book and matching engine in Java that never allocates.
 
 It reads raw Nasdaq TotalView-ITCH 5.0 files, rebuilds the order book, and
 matches against it. The design constraint is zero allocation on the hot path.
-No garbage means no collector, and that gets proven rather than claimed: the
-engine runs a full measurement pass under Epsilon GC, a collector that never
-reclaims anything, in a 512 MB heap.
+No garbage means no collector, and that gets proven rather than claimed: a
+full 268M-message session replays under Epsilon GC, a collector that never
+reclaims anything, finishing with 95 MB used.
 
 Validated on a real session: 268,744,780 messages from 2019-12-30, 8.25 GB,
 parsed at 7.8M msg/s. That session also falsified one of the design's core
 assumptions, written up in [What real data broke](#what-real-data-broke).
 
-85 tests. 15M fuzzed operations against an independent reference engine, zero
+87 tests. 15M fuzzed operations against an independent reference engine, zero
 divergences.
 
 ## Running it
@@ -108,6 +108,33 @@ the ask. That is the invariant a mis-repaired cached touch breaks first.
 
 The $0.035 mean spread is the sanity check: about three and a half cents on a
 $289 stock, which is what AAPL traded at.
+
+### Sub-penny symbols
+
+`AAU` averages $0.7092 and quotes 98.5% of its prices off the penny grid. It is
+the case `--tick 1` exists for, and the two runs show what the parameter costs:
+
+| `--book AAU` | off-band | top-of-book changes | mean spread |
+|---|---:|---:|---:|
+| `--tick 100` (default) | 6,222 of 6,265 | 93 | $0.0607 |
+| `--tick 1` | **1** | **1,448** | **$0.0273** |
+
+At the wrong tick the book degrades instead of failing: nearly everything goes
+off-band and the count says so. At the right one it reconstructs cleanly. Both
+runs report zero unknown references and zero crossed quotes.
+
+### The whole session, under a collector that never reclaims
+
+```bash
+./gradlew replayEpsilon --args="data/12302019.NASDAQ_ITCH50 --book AAPL"
+```
+
+268,744,780 messages parsed and AAPL rebuilt under Epsilon GC in a 1 GB heap,
+finishing with **95 MB used**. One 16-byte object per message would have been
+4.3 GB and killed the run. This covers the feed handler and the book, not just
+the engine.
+
+Warm page cache, it parses at 9.8M msg/s.
 
 ## What real data broke
 

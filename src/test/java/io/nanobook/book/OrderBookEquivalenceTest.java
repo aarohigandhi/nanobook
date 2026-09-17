@@ -260,6 +260,38 @@ class OrderBookEquivalenceTest {
     }
 
     @Test
+    void tickSizeOneHoldsSubPennyPricesInBand() {
+        // AAU on 2019-12-30: $0.7092 mean, 98.5% of its prices off the penny
+        // grid. At the default tick it puts 6,222 of 6,265 orders off-band. At
+        // tick 1 it reconstructs normally, which is what --tick 1 is for.
+        ArrayOrderBook array = new ArrayOrderBook(LOCATE, 1, 1 << 16, 1 << 16);
+        array.onAddOrder(TS, LOCATE, 1, true, 100, SYMBOL, 7_092);
+        array.onAddOrder(TS, LOCATE, 2, true, 100, SYMBOL, 7_089);
+        array.onAddOrder(TS, LOCATE, 3, false, 100, SYMBOL, 7_150);
+
+        assertEquals(0, array.offBandOrders(),
+                "sub-penny prices are on the grid when the tick is 1");
+        assertEquals(7_092, array.bestBid());
+        assertEquals(7_150, array.bestAsk());
+        assertEquals(3, array.orderCount());
+    }
+
+    @Test
+    void theSameBookAtPennyTickSendsThoseOrdersOffBand() {
+        ArrayOrderBook array = new ArrayOrderBook(LOCATE, 100, 1 << 16, 1 << 16);
+        array.onAddOrder(TS, LOCATE, 1, true, 100, SYMBOL, 7_092);
+        array.onAddOrder(TS, LOCATE, 2, true, 100, SYMBOL, 7_089);
+        array.onAddOrder(TS, LOCATE, 3, false, 100, SYMBOL, 7_150);
+
+        // Degrades and reports, rather than throwing. The orders are still
+        // there and still addressable; they just are not in any level.
+        assertEquals(3, array.offBandOrders());
+        assertEquals(3, array.orderCount());
+        assertEquals(OrderBook.NO_PRICE, array.bestBid());
+        assertEquals(OrderBook.NO_PRICE, array.bestAsk());
+    }
+
+    @Test
     void executesAndReducesOffBandOrders() {
         ArrayOrderBook array = new ArrayOrderBook();
         array.onAddOrder(TS, LOCATE, 1, true, 500, SYMBOL, 10_050 + 7);
