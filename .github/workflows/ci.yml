@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Tests
+        run: ./gradlew test
+
+      # The differential fuzzer is the reason to trust the fast engine: it is
+      # checked against the reference implementation, not against itself. The
+      # full 30,000 sequence run lives in the README; this is the short one.
+      - name: Fuzz the matching engine against the reference
+        run: ./gradlew fuzz --args="2000 200"
+
+      # Epsilon never reclaims, so steady state garbage exhausts the heap and
+      # kills the run. Surviving is the zero allocation claim, unfakeable.
+      - name: Prove zero allocation under Epsilon GC
+        run: ./gradlew latencyEpsilon
